@@ -18,6 +18,11 @@ OPTIONS_PAPER_LEDGER_PATH = OPTIONS_DIR / "paper_options_ledger.jsonl"
 OPTIONS_PAPER_CANDIDATES_PATH = OPTIONS_DIR / "paper_options_candidates.jsonl"
 LEDGER_PATH = DATA_DIR / "mock_ledger.jsonl"
 
+INTRADAY_DIR = DATA_DIR / "intraday"
+INTRADAY_BARS_DIR = INTRADAY_DIR / "bars"
+INTRADAY_SYNTHETIC_BARS_DIR = INTRADAY_DIR / "synthetic_bars"
+INTRADAY_EDGAR_DIR = INTRADAY_DIR / "edgar_cache"
+
 SOURCE_THESIS_DIR = DATA_DIR / "source_thesis"
 SOURCE_THESIS_REPORT_DIR = SOURCE_THESIS_DIR / "reports"
 COMPANY_INTELLIGENCE_DIR = DATA_DIR / "company_intelligence"
@@ -101,5 +106,9 @@ def ensure_dirs() -> None:
         SOURCE_THESIS_DIR,
         SOURCE_THESIS_REPORT_DIR,
         COMPANY_INTELLIGENCE_DIR,
+        INTRADAY_DIR,
+        INTRADAY_BARS_DIR,
+        INTRADAY_SYNTHETIC_BARS_DIR,
+        INTRADAY_EDGAR_DIR,
     ):
         path.mkdir(parents=True, exist_ok=True)

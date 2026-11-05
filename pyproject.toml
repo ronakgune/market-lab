@@ -25,6 +25,16 @@ market-lab-prediction = "market_lab.prediction_markets.cli:main"
 dev = [
   "pytest>=8",
 ]
+# Intraday foundation (market_lab.intraday): historical 1-minute bars, EDGAR
+# earnings events, Parquet/DuckDB bar store. Exact pins, verified on PyPI
+# 2026-11-05 (alpaca-py -> alpacahq/alpaca-py, edgartools -> dgunning/edgartools,
+# duckdb -> duckdb/duckdb-python, pyarrow -> apache/arrow).
+intraday = [
+  "alpaca-py==0.45.0",
+  "duckdb==2.0.0",
+  "edgartools==5.62.1",
+  "pyarrow==26.0.1",
+]
 
 [tool.setuptools.packages.find]
 include = ["market_lab*"]
