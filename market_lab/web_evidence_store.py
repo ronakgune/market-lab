@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import tempfile
 import fcntl
 from dataclasses import asdict
@@ -66,7 +67,11 @@ def _snapshot_dir(base: Path, snapshot_id: str) -> Path:
     if not snapshot_id.startswith("sha256:"):
         raise ValueError("snapshot_id must start with sha256:")
     digest = snapshot_id.split(":", 1)[1]
-    if len(digest) < 3:
+    # Fullmatch, not a length check (audit run-1, finding 3): a digest is
+    # exactly 64 lowercase hex chars. Anything else — including ../
+    # traversal segments — is invalid, so the resolved path is confined
+    # to the content-addressed store by construction.
+    if not re.fullmatch(r"[0-9a-f]{64}", digest):
         raise ValueError("snapshot_id digest is invalid")
     return base / "snapshots" / "sha256" / digest[:2] / digest
 

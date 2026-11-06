@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import tempfile
 from contextlib import contextmanager
@@ -93,25 +94,58 @@ def position_market_value(portfolio: Portfolio, symbol: str, prices: dict[str, f
         return 0.0
     return pos.quantity * prices.get(pos.symbol, pos.avg_price)
 
+def _reject_json_constant(value: str) -> None:
+    """json parse_constant hook: NaN/Infinity tokens in stored JSON are
+    corrupt state, not numbers. Raising ValueError routes loaders into
+    their existing corrupt-state fallback instead of parsing a float
+    that silently defeats every comparison-based risk gate."""
+    raise ValueError(f"non-finite JSON constant in stored data: {value}")
+
+
+def _portfolio_numbers_finite(portfolio: Portfolio) -> bool:
+    """True when every number a risk gate reads from portfolio state is
+    finite. parse_constant only stops the NaN/Infinity *tokens*; a value
+    like 1e999 is valid JSON syntax that float() parses to inf, and a
+    hand-built Portfolio can carry NaN directly — both defeat the same
+    comparison gates, so state is validated wherever it is consumed."""
+    try:
+        if not math.isfinite(portfolio.cash):
+            return False
+        return all(
+            math.isfinite(p.quantity) and math.isfinite(p.avg_price)
+            for p in portfolio.positions.values()
+        )
+    except TypeError:
+        return False
+
+
 def load_portfolio(path: Path = STATE_PATH) -> Portfolio:
     if not path.exists():
         return Portfolio()
     try:
-        data=json.loads(path.read_text())
+        data=json.loads(path.read_text(), parse_constant=_reject_json_constant)
         positions={sym: Position(**p) for sym,p in data.get("positions", {}).items()}
-        return Portfolio(cash=float(data.get("cash", RISK.starting_cash)), positions=positions)
+        portfolio = Portfolio(cash=float(data.get("cash", RISK.starting_cash)), positions=positions)
+        if not _portfolio_numbers_finite(portfolio):
+            raise ValueError("portfolio state contains non-finite values")
+        return portfolio
     except (json.JSONDecodeError, TypeError, ValueError):
         return Portfolio()
 
 def save_portfolio(portfolio: Portfolio, path: Path = STATE_PATH) -> None:
     ensure_dirs()
     data={"cash": portfolio.cash, "positions": {k: asdict(v) for k,v in portfolio.positions.items() if v.quantity != 0}}
-    _atomic_write_text(path, json.dumps(data, indent=2, sort_keys=True))
+    _atomic_write_text(path, json.dumps(data, indent=2, sort_keys=True, allow_nan=False))
 
 def append_ledger(decision: OrderDecision, path: Path = LEDGER_PATH) -> None:
     ensure_dirs()
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a") as f:
+        # The ledger is an append-only audit record of what was ATTEMPTED,
+        # including rejected non-finite orders — it must never raise on a
+        # rejected decision, and it is never parsed back into a risk gate.
+        # State writers (save_portfolio, candidate writers) are the strict
+        # allow_nan=False boundary; this log is not.
         f.write(json.dumps(asdict(decision), sort_keys=True) + "\n")
 
 def append_order_candidates(candidates: list[OrderCandidate], path: Path = PENDING_CANDIDATES_PATH) -> None:
@@ -119,7 +153,7 @@ def append_order_candidates(candidates: list[OrderCandidate], path: Path = PENDI
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a") as f:
         for candidate in candidates:
-            f.write(json.dumps(asdict(candidate), sort_keys=True) + "\n")
+            f.write(json.dumps(asdict(candidate), sort_keys=True, allow_nan=False) + "\n")
 
 def load_order_candidates(path: Path = PENDING_CANDIDATES_PATH) -> list[OrderCandidate]:
     if not path.exists():
@@ -130,7 +164,18 @@ def load_order_candidates(path: Path = PENDING_CANDIDATES_PATH) -> list[OrderCan
             for line in f:
                 line=line.strip()
                 if line:
-                    candidates.append(OrderCandidate(**json.loads(line)))
+                    candidate = OrderCandidate(**json.loads(line, parse_constant=_reject_json_constant))
+                    # 1e999-style values parse to inf without tripping
+                    # parse_constant; a candidate carrying one is corrupt.
+                    try:
+                        finite = all(math.isfinite(v) for v in (
+                            candidate.quantity, candidate.confidence,
+                            candidate.reference_close))
+                    except TypeError:
+                        finite = False
+                    if not finite:
+                        raise ValueError("order candidate contains non-finite values")
+                    candidates.append(candidate)
     except (json.JSONDecodeError, TypeError, ValueError):
         return []
     return candidates
@@ -140,7 +185,7 @@ def save_order_candidates(candidates: list[OrderCandidate], path: Path = PENDING
     if not candidates:
         _atomic_write_text(path, "")
         return
-    text = "".join(json.dumps(asdict(candidate), sort_keys=True) + "\n" for candidate in candidates)
+    text = "".join(json.dumps(asdict(candidate), sort_keys=True, allow_nan=False) + "\n" for candidate in candidates)
     _atomic_write_text(path, text)
 
 def candidate_to_order_at_open(candidate: OrderCandidate, next_open: float, prices: dict[str, float], portfolio_path: Path = STATE_PATH, ledger_path: Path = LEDGER_PATH, execution_date: str | None = None) -> OrderDecision:
@@ -162,6 +207,27 @@ def evaluate_order(portfolio: Portfolio, side: Side, symbol: str, quantity: int,
     symbol=symbol.upper()
     if risk.live_trading_enabled:
         return OrderDecision(False, side, symbol, quantity, price, None, "live trading flag unexpectedly enabled; mock broker refuses", now)
+    # Finiteness gate FIRST (audit run-1, finding 1): every comparison
+    # below is False for NaN, so a non-finite quantity/price would sail
+    # through positivity, notional, cash and position gates and then be
+    # persisted into portfolio state. Reject before any comparison.
+    try:
+        finite = math.isfinite(quantity) and math.isfinite(price)
+    except TypeError:
+        finite = False
+    if not finite:
+        return OrderDecision(False, side, symbol, quantity, price, None, "quantity and price must be finite", now)
+    # The order is only half the input: NaN/inf in portfolio state (cash,
+    # a position's quantity/avg_price) defeats the same gates from the
+    # other side and persists poisoned state on acceptance.
+    if not _portfolio_numbers_finite(portfolio):
+        return OrderDecision(False, side, symbol, quantity, price, None, "portfolio state must be finite", now)
+    if symbol in prices:
+        try:
+            if not math.isfinite(prices[symbol]):
+                return OrderDecision(False, side, symbol, quantity, price, None, "reference price must be finite", now)
+        except TypeError:
+            return OrderDecision(False, side, symbol, quantity, price, None, "reference price must be finite", now)
     if quantity <= 0 or price <= 0:
         return OrderDecision(False, side, symbol, quantity, price, None, "quantity and price must be positive", now)
     if side not in ("BUY", "SELL"):

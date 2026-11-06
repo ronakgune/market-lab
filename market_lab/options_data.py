@@ -196,7 +196,7 @@ def _contract_from_record(c: dict, as_of: str) -> OptionContract:
     greeks_data = dict(c["greeks"])
     if "degenerate" not in greeks_data:
         greeks_data["degenerate"] = _legacy_degenerate_from_record(c, as_of)
-    return OptionContract(
+    contract = OptionContract(
         underlying=c["underlying"],
         expiration=c["expiration"],
         strike=float(c["strike"]),
@@ -204,11 +204,33 @@ def _contract_from_record(c: dict, as_of: str) -> OptionContract:
         quote=OptionQuote(**c["quote"]),
         greeks=OptionGreeks(**greeks_data),
     )
+    # Stored-record path finiteness (audit run-1, finding 2): unlike the
+    # yfinance path (_float_value maps NaN to a default), records consumed
+    # by the paper execution step passed float fields through unchecked.
+    # Drop — raise on — any contract with a non-finite strike/quote/greek;
+    # callers that load collections already skip records raising ValueError.
+    numeric = [contract.strike, contract.quote.bid, contract.quote.ask,
+               contract.quote.mid, contract.quote.volume,
+               contract.quote.open_interest,
+               contract.greeks.delta, contract.greeks.gamma,
+               contract.greeks.theta, contract.greeks.vega,
+               contract.greeks.implied_volatility]
+    try:
+        finite = all(math.isfinite(v) for v in numeric)
+    except TypeError:
+        finite = False
+    if not finite:
+        raise ValueError("option contract record contains non-finite values")
+    return contract
+
+
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"non-finite JSON constant in stored data: {value}")
 
 
 def load_option_chain_snapshot(symbol: str, chain_dir: Path = OPTIONS_CHAIN_DIR) -> OptionChainSnapshot:
     path = _snapshot_path(symbol, chain_dir)
-    data = json.loads(path.read_text())
+    data = json.loads(path.read_text(), parse_constant=_reject_json_constant)
     contracts = [_contract_from_record(c, data.get("as_of", "")) for c in data.get("contracts", [])]
 
     return OptionChainSnapshot(

@@ -108,6 +108,10 @@ def _resolve_public(host: str, port: int) -> list[str]:
     return ips
 
 
+_MAX_RESPONSE_HEADERS = 100
+_MAX_HEADER_BYTES = 64 * 1024
+
+
 def _read_http_response(sock, *, max_bytes: int) -> tuple[int, bytes, dict[str, str]]:
     fp = sock.makefile("rb")
     status_line = fp.readline(65536).decode("iso-8859-1", errors="replace").strip()
@@ -116,10 +120,17 @@ def _read_http_response(sock, *, max_bytes: int) -> tuple[int, bytes, dict[str, 
     parts = status_line.split(" ", 2)
     status = int(parts[1])
     headers: dict[str, str] = {}
+    header_bytes = 0
     while True:
         line = fp.readline(65536)
         if line in {b"\r\n", b"\n", b""}:
             break
+        # Header budget (audit run-1, finding 4): the body had a byte cap
+        # but headers accumulated without bound — a drip-feeding origin
+        # could grow memory indefinitely under per-operation timeouts.
+        header_bytes += len(line)
+        if len(headers) >= _MAX_RESPONSE_HEADERS or header_bytes > _MAX_HEADER_BYTES:
+            raise RuntimeError("too_large:response header limit exceeded")
         text = line.decode("iso-8859-1", errors="replace")
         if ":" in text:
             k, v = text.split(":", 1)
@@ -137,7 +148,7 @@ def _read_http_response(sock, *, max_bytes: int) -> tuple[int, bytes, dict[str, 
     return status, b"".join(chunks), headers
 
 
-def _single_pinned_fetch(url: str, *, timeout_seconds: int, max_bytes: int) -> tuple[int, bytes, dict[str, str]]:
+def _single_pinned_fetch(url: str, *, timeout_seconds: int, max_bytes: int, deadline: float | None = None) -> tuple[int, bytes, dict[str, str]]:
     parsed = urlparse(url)
     host = parsed.hostname or ""
     port = parsed.port or (443 if parsed.scheme == "https" else 80)
@@ -147,9 +158,18 @@ def _single_pinned_fetch(url: str, *, timeout_seconds: int, max_bytes: int) -> t
         target += f"?{parsed.query}"
     last_error: Exception | None = None
     for ip in ips:
+        # Aggregate deadline (audit run-1, finding 4): per-operation
+        # timeouts alone multiply across IPs and redirect hops, so each
+        # attempt gets only the time actually left in the caller's budget.
+        effective_timeout = timeout_seconds
+        if deadline is not None:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                raise RuntimeError("transport_error:aggregate deadline exceeded")
+            effective_timeout = min(timeout_seconds, remaining)
         try:
-            raw = socket.create_connection((ip, port), timeout=timeout_seconds)
-            raw.settimeout(timeout_seconds)
+            raw = socket.create_connection((ip, port), timeout=effective_timeout)
+            raw.settimeout(effective_timeout)
             sock = raw
             if parsed.scheme == "https":
                 ctx = ssl.create_default_context()
@@ -186,10 +206,13 @@ def _http_fetch(
 
     current = validated
     start = time.time()
+    deadline = start + timeout_seconds
     redirects_left = max_redirects
     try:
         while True:
-            status, payload, headers = _single_pinned_fetch(current, timeout_seconds=timeout_seconds, max_bytes=max_bytes)
+            if time.time() >= deadline:
+                raise RuntimeError("transport_error:aggregate deadline exceeded")
+            status, payload, headers = _single_pinned_fetch(current, timeout_seconds=timeout_seconds, max_bytes=max_bytes, deadline=deadline)
             if status in {301, 302, 303, 307, 308}:
                 location = headers.get("location", "")
                 if not location:

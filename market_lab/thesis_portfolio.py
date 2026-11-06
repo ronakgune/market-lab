@@ -14,6 +14,7 @@ All output is paper-only. No live broker path.
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -185,12 +186,42 @@ def compute_deterministic_sizing(
 
     Uses only portfolio state and conviction parameter. NEVER uses model/LLM prose.
     """
-    if price <= 0:
+    if not (price > 0) or not math.isfinite(price):  # rejects NaN and inf price
         return SizingDecision(
             proposed_notional=Decimal("0"), max_notional=Decimal("0"),
             position_pct=0.0, position_cap_pct=portfolio.max_position_pct,
             portfolio_cap_remaining=0.0, approved_notional=Decimal("0"),
             rejected=True, reject_reason="invalid price",
+        )
+
+    # Non-finite portfolio state (NaN/inf cash or exposure) otherwise
+    # flows through the caps and comes out as a NaN/Infinity approved
+    # notional with rejected=False — the same class fix 5 closed for
+    # conviction, from the state side.
+    try:
+        state_finite = all(math.isfinite(v) for v in (
+            portfolio.total_cash, portfolio.total_paper_exposure,
+            portfolio.max_position_pct, portfolio.max_portfolio_exposure_pct,
+            portfolio.cash_reserve_pct))
+    except TypeError:
+        state_finite = False
+    if not state_finite:
+        return SizingDecision(
+            proposed_notional=Decimal("0"), max_notional=Decimal("0"),
+            position_pct=0.0, position_cap_pct=portfolio.max_position_pct,
+            portfolio_cap_remaining=0.0, approved_notional=Decimal("0"),
+            rejected=True, reject_reason="portfolio state must be finite",
+        )
+
+    # Conviction is documented as a float in [0, 1]; an out-of-range or
+    # non-finite value previously produced a negative (or NaN) approved
+    # notional with rejected=False. Reject it at the gate.
+    if not (0.0 <= conviction <= 1.0):  # also rejects NaN: its comparisons are False
+        return SizingDecision(
+            proposed_notional=Decimal("0"), max_notional=Decimal("0"),
+            position_pct=0.0, position_cap_pct=portfolio.max_position_pct,
+            portfolio_cap_remaining=0.0, approved_notional=Decimal("0"),
+            rejected=True, reject_reason="conviction outside [0, 1]",
         )
 
     if portfolio.total_cash <= 0:
@@ -225,6 +256,19 @@ def compute_deterministic_sizing(
 
     proposed = min(conviction_sizing, max_by_position, max_by_portfolio)
     max_allowed = min(max_by_position, max_by_portfolio)
+
+    # Also reject a proposed amount that rounds to zero cents: approving
+    # Decimal("0.00") with rejected=False is a non-positive approval in
+    # everything but name (a tiny positive conviction does exactly this).
+    if proposed <= 0 or round(proposed, 2) <= 0:
+        return SizingDecision(
+            proposed_notional=Decimal("0"),
+            max_notional=Decimal(str(round(max_allowed, 2))),
+            position_pct=0.0, position_cap_pct=portfolio.max_position_pct,
+            portfolio_cap_remaining=max_by_portfolio,
+            approved_notional=Decimal("0"),
+            rejected=True, reject_reason="non-positive approved notional",
+        )
 
     overrides: List[str] = []
     if conviction_sizing > max_by_position:

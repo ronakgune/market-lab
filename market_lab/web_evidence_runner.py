@@ -1334,7 +1334,16 @@ def verify_run(
                 raw_ok = raw_path.exists() and sha256_hex(raw_path.read_bytes()) == manifest.get("raw_sha256")
                 files_ok = manifest_path.exists() and extracted_path.exists() and raw_ok
                 segment_row = segment_by_id.get(row.get("segment_id"))
-                segment_ok = bool(segment_row and verify_segment_locator(run_dir, type("SegmentLike", (), segment_row)()))
+                # Bind the segment to THIS evidence row's snapshot (audit
+                # run-1, finding 3): without the equality check, a segment
+                # whose excerpt lives in a different snapshot validates
+                # against the wrong evidence — verify_segment_locator only
+                # checks the excerpt against the segment's own snapshot.
+                segment_ok = bool(
+                    segment_row
+                    and segment_row.get("snapshot_id") == snapshot_id
+                    and verify_segment_locator(run_dir, type("SegmentLike", (), segment_row)())
+                )
             except Exception:
                 files_ok = False
                 segment_ok = False
