@@ -110,7 +110,14 @@ def _synthetic_prices(symbol: str, days: int = 260, end: date | None = None) -> 
         d += timedelta(days=1)
     return bars
 
-def fetch_prices(symbol: str, days: int = 260, prefer_network: bool = True, max_cache_age_days: int = 3) -> tuple[list[Bar], str]:
+def fetch_prices(symbol: str, days: int = 260, prefer_network: bool = True, max_cache_age_days: int = 3, require_live: bool = False) -> tuple[list[Bar], str]:
+    """Fetch daily bars via yfinance -> cache -> synthetic fallback.
+
+    WARNING: the final fallback is DETERMINISTIC SYNTHETIC data. Callers
+    whose numbers will be believed (strategy streams, backtests) must pass
+    ``require_live=True`` — synthetic sources then raise instead of
+    returning — or use ``market_lab.daily_data`` (Alpaca + provenance).
+    """
     ensure_dirs()
     if prefer_network:
         try:
@@ -142,6 +149,10 @@ def fetch_prices(symbol: str, days: int = 260, prefer_network: bool = True, max_
         newest = cached[-1].date
         if newest >= date.today() - timedelta(days=max_cache_age_days):
             return cached[-days:], "cache"
+    if require_live:
+        raise RuntimeError(
+            f"no live or real cached data for {symbol}; refusing synthetic fallback (require_live=True)"
+        )
     synthetic_cached = load_cached_synthetic_prices(symbol)
     if len(synthetic_cached) >= min(days, 30):
         newest = synthetic_cached[-1].date

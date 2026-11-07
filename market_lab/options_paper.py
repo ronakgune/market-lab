@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import tempfile
 from contextlib import contextmanager
@@ -9,7 +10,7 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Literal
 
-from .broker import Portfolio
+from .broker import Portfolio, _portfolio_numbers_finite
 from .config import OPTIONS_CHAIN_DIR, OPTIONS_PAPER_CANDIDATES_PATH, OPTIONS_PAPER_LEDGER_PATH, OPTIONS_PAPER_STATE_PATH, OptionsRiskConfig, OPTIONS_RISK, ensure_dirs
 from .options_data import OptionContract
 
@@ -124,9 +125,48 @@ def _opening_guardrail_violation(paper: OptionPaperPortfolio, order: OptionPaper
     return None
 
 
+def _reject_json_constant(value: str) -> None:
+    """json parse_constant hook: NaN/Infinity tokens in stored JSON are
+    corrupt state, not numbers (see broker._reject_json_constant)."""
+    raise ValueError(f"non-finite JSON constant in stored data: {value}")
+
+
+def _order_numbers_finite(order: OptionPaperOrder) -> bool:
+    c = order.contract
+    values = [order.price, c.strike, c.quote.bid, c.quote.ask, c.quote.mid,
+              c.quote.volume, c.quote.open_interest,
+              c.greeks.delta, c.greeks.gamma, c.greeks.theta, c.greeks.vega,
+              c.greeks.implied_volatility]
+    try:
+        return all(math.isfinite(v) for v in values)
+    except TypeError:
+        return False
+
+
+def _paper_numbers_finite(paper: OptionPaperPortfolio) -> bool:
+    """State-side counterpart of _order_numbers_finite: NaN/inf in paper
+    state defeats the premium/reserve/assignment gates from the other
+    side. The equity portfolio is checked with broker's equivalent."""
+    try:
+        values = [paper.cash, paper.reserved_cash,
+                  *paper.positions.values(), *paper.avg_price.values(),
+                  *paper.reserved_shares.values()]
+        return all(math.isfinite(v) for v in values)
+    except TypeError:
+        return False
+
+
 def evaluate_option_paper_order(paper: OptionPaperPortfolio, equity_portfolio: Portfolio, order: OptionPaperOrder, risk: OptionsRiskConfig = OPTIONS_RISK) -> OptionPaperDecision:
     if not risk.allow_options or not risk.paper_options_enabled or risk.live_options_enabled:
         return _reject(order, "paper options are disabled or live options unexpectedly enabled")
+    # Finiteness gate FIRST (audit run-1, finding 2): NaN in price /
+    # strike / quote / greeks makes every guardrail comparison False, so
+    # premium, reserve and assignment gates would not bind and NaN would
+    # be persisted into paper state. Reject before any comparison.
+    if not _order_numbers_finite(order):
+        return _reject(order, "order, strike, quote and greeks must be finite")
+    if not _paper_numbers_finite(paper) or not _portfolio_numbers_finite(equity_portfolio):
+        return _reject(order, "portfolio state must be finite")
     if order.contracts <= 0 or order.price <= 0:
         return _reject(order, "contracts and price must be positive")
     if order.contracts > risk.max_contracts_per_symbol:
@@ -220,14 +260,24 @@ def evaluate_option_paper_order(paper: OptionPaperPortfolio, equity_portfolio: P
 def save_option_paper_portfolio(portfolio: OptionPaperPortfolio, path: Path = OPTIONS_PAPER_STATE_PATH) -> None:
     ensure_dirs()
     with _portfolio_lock(path):
-        _atomic_write_text(path, json.dumps(asdict(portfolio), indent=2, sort_keys=True))
+        _atomic_write_text(path, json.dumps(asdict(portfolio), indent=2, sort_keys=True, allow_nan=False))
 
 
 def load_option_paper_portfolio(path: Path = OPTIONS_PAPER_STATE_PATH) -> OptionPaperPortfolio:
     if not path.exists():
         return OptionPaperPortfolio()
     try:
-        data = json.loads(path.read_text())
+        data = json.loads(path.read_text(), parse_constant=_reject_json_constant)
+        # Validate BEFORE int()/float() coercion: 1e999 parses to inf
+        # without tripping parse_constant, and int(inf) raises
+        # OverflowError (not caught below) while float(inf) loads
+        # silently and defeats the cash/reserve gates.
+        raw_numbers = [data.get("cash", 100_000.0), data.get("reserved_cash", 0.0),
+                       *data.get("positions", {}).values(),
+                       *data.get("avg_price", {}).values(),
+                       *data.get("reserved_shares", {}).values()]
+        if not all(math.isfinite(v) for v in raw_numbers):
+            raise ValueError("option paper state contains non-finite values")
         return OptionPaperPortfolio(
             cash=float(data.get("cash", 100_000.0)),
             positions={k: int(v) for k, v in data.get("positions", {}).items()},
@@ -243,6 +293,9 @@ def append_option_paper_ledger(decision: OptionPaperDecision, path: Path = OPTIO
     ensure_dirs()
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a") as f:
+        # Append-only audit record of attempts (incl. rejected non-finite
+        # orders): must never raise on a rejection; never parsed into a
+        # risk gate. Strictness lives in the state/candidate writers.
         f.write(json.dumps(asdict(decision), sort_keys=True) + "\n")
         f.flush()
         os.fsync(f.fileno())
@@ -272,7 +325,7 @@ def save_option_paper_candidates(
 ) -> None:
     ensure_dirs()
     path.parent.mkdir(parents=True, exist_ok=True)
-    lines = [json.dumps(asdict(candidate), sort_keys=True) for candidate in candidates]
+    lines = [json.dumps(asdict(candidate), sort_keys=True, allow_nan=False) for candidate in candidates]
     _atomic_write_text(path, ("\n".join(lines) + "\n") if lines else "")
 
 
@@ -281,12 +334,15 @@ def _candidate_from_record(record: dict) -> OptionPaperCandidate:
 
     contract_data = record.get("contract", {})
     contract = _contract_from_record(contract_data, record.get("signal_as_of", ""))
+    reference_price = float(record.get("reference_price", contract.quote.mid))
+    if not math.isfinite(reference_price):
+        raise ValueError("candidate reference_price must be finite")
     return OptionPaperCandidate(
         action=record["action"],
         contract=contract,
         contracts=int(record.get("contracts", 0)),
         strategy=record.get("strategy", "paper_options"),
-        reference_price=float(record.get("reference_price", contract.quote.mid)),
+        reference_price=reference_price,
         signal_as_of=record.get("signal_as_of", ""),
     )
 
@@ -299,7 +355,7 @@ def load_option_paper_candidates(path: Path = OPTIONS_PAPER_CANDIDATES_PATH) -> 
         if not line.strip():
             continue
         try:
-            candidates.append(_candidate_from_record(json.loads(line)))
+            candidates.append(_candidate_from_record(json.loads(line, parse_constant=_reject_json_constant)))
         except (json.JSONDecodeError, KeyError, TypeError, ValueError):
             continue
     return candidates

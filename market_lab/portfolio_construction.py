@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from math import isfinite, sqrt
 from statistics import mean, pstdev
 
+from .backtest import ExecutionModel
 from .data import Bar
 from .indicators import max_drawdown
 
@@ -26,6 +27,7 @@ class RebalanceSnapshot:
     fill_prices: dict[str, float]
     equity_before: float
     equity_after: float
+    vol_scale: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -38,6 +40,8 @@ class DualMomentumBacktestResult:
     rebalances: int
     snapshots: list[RebalanceSnapshot]
     strategy: str = "dual_momentum"
+    benchmark_symbol: str = ""
+    costs_paid: float = 0.0
 
 
 def _clamp(value: float, lo: float, hi: float) -> float:
@@ -167,6 +171,30 @@ def _stats(equity_curve: list[float]) -> tuple[float, float, float]:
     return total_return, mdd, sharpe
 
 
+def _vol_scale(equity_curve: list[float], target_vol: float | None, vol_window: int) -> float:
+    """Daniel-Moskowitz style vol scaling: shrink exposure toward a constant
+    volatility target using the strategy's own trailing realized vol.
+
+    Returns 1.0 (no scaling) until at least 20 daily returns exist — early
+    rebalances have no measurable vol, and inventing one would be worse.
+    Long-only: the scale never exceeds 1.0 (no leverage).
+    """
+    if target_vol is None:
+        return 1.0
+    rets = [
+        equity_curve[i] / equity_curve[i - 1] - 1.0
+        for i in range(max(1, len(equity_curve) - vol_window), len(equity_curve))
+        if equity_curve[i - 1] > 0
+    ]
+    if len(rets) < 20:
+        return 1.0
+    sd = pstdev(rets)
+    if sd <= 0:
+        return 1.0
+    realized = sd * sqrt(252)
+    return _clamp(target_vol / realized, 0.0, 1.0)
+
+
 def run_dual_momentum_backtest(
     bars_by_symbol: dict[str, list[Bar]],
     formation_days: int = 252,
@@ -177,9 +205,31 @@ def run_dual_momentum_backtest(
     initial_cash: float = 10_000.0,
     max_weight: float = 0.20,
     absolute_threshold: float = 0.0,
+    spy_bars: list[Bar] | None = None,
+    execution: ExecutionModel | None = None,
+    target_vol: float | None = None,
+    vol_window: int = 60,
+    benchmark_symbol: str = "SPY",
 ) -> DualMomentumBacktestResult:
+    """Dual-momentum backtest with honest measurement defaults.
+
+    - Costs are ON unless explicitly disabled: `execution=None` selects the
+      repo's standard ExecutionModel (5bps slippage + $1/trade); pass
+      ExecutionModel(0, 0) for a frictionless run, as a deliberate choice.
+    - The benchmark is SPY: pass `spy_bars` (also used for the absolute
+      momentum gate), or include the benchmark symbol in `bars_by_symbol`.
+      It is never silently "the alphabetically first symbol" anymore.
+    - `target_vol` enables vol scaling of target weights (see _vol_scale);
+      the cross-sectional momentum literature treats this as mandatory
+      risk management, and stream runners always set it.
+    """
     if rebalance_every <= 0:
         raise ValueError("rebalance_every must be positive")
+    if target_vol is not None and target_vol <= 0:
+        raise ValueError("target_vol must be positive when set")
+    if vol_window < 20:
+        raise ValueError("vol_window must be at least 20 (the minimum returns for a vol estimate)")
+    execution = execution or ExecutionModel()
     if not bars_by_symbol:
         return DualMomentumBacktestResult(0.0, 0.0, 0.0, 0.0, initial_cash, 0, [])
 
@@ -196,10 +246,21 @@ def run_dual_momentum_backtest(
     if start >= end:
         return DualMomentumBacktestResult(0.0, 0.0, 0.0, 0.0, initial_cash, 0, [])
 
+    # Align SPY onto the universe's common calendar, index-for-index, so the
+    # momentum gate and the benchmark read the same dates as the universe.
+    aligned_spy: list[Bar] | None = None
+    if spy_bars:
+        reference = next(iter(normalized_bars_by_symbol.values()))
+        spy_by_date = {bar.date: bar for bar in spy_bars}
+        if any(bar.date not in spy_by_date for bar in reference):
+            raise ValueError("spy_bars do not cover the universe calendar; refusing to misalign the benchmark/gate")
+        aligned_spy = [spy_by_date[bar.date] for bar in reference]
+
     cash = initial_cash
     positions: dict[str, float] = {}
     equity_curve: list[float] = [initial_cash]
     snapshots: list[RebalanceSnapshot] = []
+    costs_paid = 0.0
 
     for idx in range(start, end):
         if (idx - start) % rebalance_every == 0 and idx + 1 < min_len:
@@ -212,27 +273,84 @@ def run_dual_momentum_backtest(
                 absolute_threshold=absolute_threshold,
                 max_weight=max_weight,
                 decision_index=idx,
+                spy_bars=aligned_spy,
             )
             fill_idx = idx + 1
-            fill_prices = {target.symbol: normalized_bars_by_symbol[target.symbol][fill_idx].open for target in targets}
+            scale = _vol_scale(equity_curve, target_vol, vol_window)
             equity_at_fill = _portfolio_value(cash, positions, normalized_bars_by_symbol, fill_idx, use_open=True)
-            new_positions: dict[str, float] = {}
-            invested = 0.0
+            desired: dict[str, float] = {}
+            fill_prices: dict[str, float] = {}
             for target in targets:
-                px = fill_prices[target.symbol]
-                allocation = equity_at_fill * _clamp(target.target_weight, 0.0, max_weight)
-                if px > 0 and allocation > 0:
-                    new_positions[target.symbol] = allocation / px
-                    invested += allocation
-            cash = max(0.0, equity_at_fill - invested)
-            positions = new_positions
-            snapshots.append(RebalanceSnapshot(idx, fill_idx, targets, fill_prices, equity_before, _portfolio_value(cash, positions, normalized_bars_by_symbol, fill_idx)))
+                open_px = normalized_bars_by_symbol[target.symbol][fill_idx].open
+                if open_px <= 0:
+                    continue
+                buy_px = execution.fill_price("BUY", open_px)
+                weight = _clamp(target.target_weight, 0.0, max_weight) * scale
+                if weight <= 0:
+                    continue
+                # Clamp at zero: a negative equity mark (garbage opens) must
+                # never turn a target weight into a short sale.
+                desired[target.symbol] = max(0.0, equity_at_fill * weight / buy_px)
+                fill_prices[target.symbol] = buy_px
+            sells: dict[str, float] = {}
+            buys: dict[str, float] = {}
+            for symbol in set(positions) | set(desired):
+                current = positions.get(symbol, 0.0)
+                want = desired.get(symbol, 0.0)
+                if want < current:
+                    sells[symbol] = current - want
+                elif want > current:
+                    buys[symbol] = want - current
+            new_positions = dict(positions)
+            proceeds = 0.0
+            for symbol, qty in sells.items():
+                open_px = normalized_bars_by_symbol[symbol][fill_idx].open
+                if open_px <= 0:
+                    # Cannot execute at a non-positive price; carry the
+                    # position (mirrors the buy-side guard on desired qtys).
+                    continue
+                sell_px = execution.fill_price("SELL", open_px)
+                proceeds += qty * sell_px - execution.commission_per_trade
+                costs_paid += qty * (open_px - sell_px) + execution.commission_per_trade
+                new_positions[symbol] = positions[symbol] - qty
+            budget = cash + proceeds
+            # Scale quantities against the notional alone, reserving the
+            # per-trade commissions from the budget first. Scaling against
+            # notional+commissions but then charging commissions in full
+            # overspends the budget by (1 - scale) x commissions on every
+            # scaled rebalance — cash silently goes negative.
+            total_notional = sum(qty * fill_prices[symbol] for symbol, qty in buys.items())
+            commissions = execution.commission_per_trade * len(buys)
+            buy_scale = 1.0
+            if total_notional + commissions > budget:
+                room = budget - commissions
+                buy_scale = max(0.0, room) / total_notional if total_notional > 0 and room > 0 else 0.0
+            spent = 0.0
+            if buy_scale > 0:
+                for symbol, qty in buys.items():
+                    scaled_qty = qty * buy_scale
+                    open_px = normalized_bars_by_symbol[symbol][fill_idx].open
+                    spent += scaled_qty * fill_prices[symbol] + execution.commission_per_trade
+                    costs_paid += scaled_qty * (fill_prices[symbol] - open_px) + execution.commission_per_trade
+                    new_positions[symbol] = new_positions.get(symbol, 0.0) + scaled_qty
+            cash = budget - spent
+            positions = {symbol: qty for symbol, qty in new_positions.items() if qty > 1e-12}
+            snapshots.append(RebalanceSnapshot(idx, fill_idx, targets, fill_prices, equity_before, _portfolio_value(cash, positions, normalized_bars_by_symbol, fill_idx), scale))
         equity_curve.append(_portfolio_value(cash, positions, normalized_bars_by_symbol, idx + 1))
 
     final_equity = equity_curve[-1]
     total_return, mdd, sharpe = _stats(equity_curve)
-    first_symbol = sorted(normalized_bars_by_symbol)[0]
-    benchmark_start = _price_at_or_before(normalized_bars_by_symbol[first_symbol], start)
-    benchmark_end = _price_at_or_before(normalized_bars_by_symbol[first_symbol], end)
-    benchmark_return = benchmark_end / benchmark_start - 1 if benchmark_start > 0 else 0.0
-    return DualMomentumBacktestResult(total_return, benchmark_return, mdd, sharpe, final_equity, len(snapshots), snapshots)
+    bench_name = ""
+    benchmark_return = 0.0
+    if aligned_spy is not None:
+        bench_name = benchmark_symbol
+        b_start = aligned_spy[start].close
+        b_end = aligned_spy[end].close
+        benchmark_return = b_end / b_start - 1 if b_start > 0 else 0.0
+    elif benchmark_symbol in normalized_bars_by_symbol:
+        bench_name = benchmark_symbol
+        bench_bars = normalized_bars_by_symbol[benchmark_symbol]
+        benchmark_start = _price_at_or_before(bench_bars, start)
+        benchmark_end = _price_at_or_before(bench_bars, end)
+        benchmark_return = benchmark_end / benchmark_start - 1 if benchmark_start > 0 else 0.0
+    return DualMomentumBacktestResult(total_return, benchmark_return, mdd, sharpe, final_equity, len(snapshots), snapshots, "dual_momentum", bench_name, costs_paid)

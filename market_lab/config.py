@@ -18,6 +18,11 @@ OPTIONS_PAPER_LEDGER_PATH = OPTIONS_DIR / "paper_options_ledger.jsonl"
 OPTIONS_PAPER_CANDIDATES_PATH = OPTIONS_DIR / "paper_options_candidates.jsonl"
 LEDGER_PATH = DATA_DIR / "mock_ledger.jsonl"
 
+INTRADAY_DIR = DATA_DIR / "intraday"
+INTRADAY_BARS_DIR = INTRADAY_DIR / "bars"
+INTRADAY_SYNTHETIC_BARS_DIR = INTRADAY_DIR / "synthetic_bars"
+INTRADAY_EDGAR_DIR = INTRADAY_DIR / "edgar_cache"
+
 SOURCE_THESIS_DIR = DATA_DIR / "source_thesis"
 SOURCE_THESIS_REPORT_DIR = SOURCE_THESIS_DIR / "reports"
 COMPANY_INTELLIGENCE_DIR = DATA_DIR / "company_intelligence"
@@ -35,6 +40,19 @@ TSMOM_LEDGER = TSMOM_DIR / "ledger.jsonl"
 TSMOM_CANDIDATES = TSMOM_DIR / "pending_candidates.jsonl"
 TSMOM_REPORT_DIR = TSMOM_DIR / "reports"
 TSMOM_STARTING_CASH = 25_000.0
+
+CRYPTO_CARRY_DIR = DATA_DIR / "crypto_carry"
+CRYPTO_CARRY_FUNDING_PATH = CRYPTO_CARRY_DIR / "funding.jsonl"
+CRYPTO_CARRY_REPORT_DIR = CRYPTO_CARRY_DIR / "reports"
+
+XS_MOMENTUM_DIR = DATA_DIR / "xs_momentum"
+XS_MOMENTUM_STATE = XS_MOMENTUM_DIR / "portfolio_state.json"
+XS_MOMENTUM_LEDGER = XS_MOMENTUM_DIR / "ledger.jsonl"
+XS_MOMENTUM_CANDIDATES = XS_MOMENTUM_DIR / "pending_candidates.jsonl"
+XS_MOMENTUM_EQUITY_HISTORY = XS_MOMENTUM_DIR / "equity_history.jsonl"
+XS_MOMENTUM_REBALANCE_LOG = XS_MOMENTUM_DIR / "rebalance_log.jsonl"
+XS_MOMENTUM_REPORT_DIR = XS_MOMENTUM_DIR / "reports"
+XS_MOMENTUM_STARTING_CASH = 25_000.0
 
 PENDING_CANDIDATES_PATH = DATA_DIR / "pending_order_candidates.jsonl"
 STATE_PATH = DATA_DIR / "mock_portfolio_state.json"
@@ -98,8 +116,16 @@ def ensure_dirs() -> None:
         VT_TREND_REPORT_DIR,
         TSMOM_DIR,
         TSMOM_REPORT_DIR,
+        XS_MOMENTUM_DIR,
+        XS_MOMENTUM_REPORT_DIR,
+        CRYPTO_CARRY_DIR,
+        CRYPTO_CARRY_REPORT_DIR,
         SOURCE_THESIS_DIR,
         SOURCE_THESIS_REPORT_DIR,
         COMPANY_INTELLIGENCE_DIR,
+        INTRADAY_DIR,
+        INTRADAY_BARS_DIR,
+        INTRADAY_SYNTHETIC_BARS_DIR,
+        INTRADAY_EDGAR_DIR,
     ):
         path.mkdir(parents=True, exist_ok=True)

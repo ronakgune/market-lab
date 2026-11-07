@@ -127,7 +127,7 @@ class WebEvidenceContractTests(unittest.TestCase):
         response = provider.fetch(FetchRequest(request_id="r", run_id="run", claim_ids=["c"], query_ids=["q"], url="http://127.0.0.1/"))
         self.assertEqual(response.status, "unsafe_url")
 
-        def fake_fetch(url: str, *, timeout_seconds: int, max_bytes: int):
+        def fake_fetch(url: str, *, timeout_seconds: int, max_bytes: int, deadline=None):
             return 302, b"", {"location": "http://127.0.0.1/secret"}
 
         with patch("market_lab.web_evidence_providers._single_pinned_fetch", fake_fetch):
