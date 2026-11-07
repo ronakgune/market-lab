@@ -42,6 +42,11 @@ class NotFoundError(PredictionMarketError):
     exit_code = 5
 
 
+class CaptureError(PredictionMarketError):
+    error_code = "PM0_CAPTURE"
+    exit_code = 5
+
+
 class PaperError(PredictionMarketError):
     error_code = "PM1_ERROR"
     exit_code = 3
