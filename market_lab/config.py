@@ -41,6 +41,15 @@ TSMOM_CANDIDATES = TSMOM_DIR / "pending_candidates.jsonl"
 TSMOM_REPORT_DIR = TSMOM_DIR / "reports"
 TSMOM_STARTING_CASH = 25_000.0
 
+XS_MOMENTUM_DIR = DATA_DIR / "xs_momentum"
+XS_MOMENTUM_STATE = XS_MOMENTUM_DIR / "portfolio_state.json"
+XS_MOMENTUM_LEDGER = XS_MOMENTUM_DIR / "ledger.jsonl"
+XS_MOMENTUM_CANDIDATES = XS_MOMENTUM_DIR / "pending_candidates.jsonl"
+XS_MOMENTUM_EQUITY_HISTORY = XS_MOMENTUM_DIR / "equity_history.jsonl"
+XS_MOMENTUM_REBALANCE_LOG = XS_MOMENTUM_DIR / "rebalance_log.jsonl"
+XS_MOMENTUM_REPORT_DIR = XS_MOMENTUM_DIR / "reports"
+XS_MOMENTUM_STARTING_CASH = 25_000.0
+
 PENDING_CANDIDATES_PATH = DATA_DIR / "pending_order_candidates.jsonl"
 STATE_PATH = DATA_DIR / "mock_portfolio_state.json"
 
@@ -103,6 +112,8 @@ def ensure_dirs() -> None:
         VT_TREND_REPORT_DIR,
         TSMOM_DIR,
         TSMOM_REPORT_DIR,
+        XS_MOMENTUM_DIR,
+        XS_MOMENTUM_REPORT_DIR,
         SOURCE_THESIS_DIR,
         SOURCE_THESIS_REPORT_DIR,
         COMPANY_INTELLIGENCE_DIR,
