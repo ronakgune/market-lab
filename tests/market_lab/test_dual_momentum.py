@@ -83,7 +83,9 @@ class DualMomentumTests(unittest.TestCase):
         self.assertEqual(result.snapshots[0].decision_index, 40)
         self.assertEqual(result.snapshots[0].fill_index, 41)
         self.assertEqual(result.snapshots[0].targets[0].symbol, "LEADER")
-        self.assertAlmostEqual(result.snapshots[0].fill_prices["LEADER"], 200.0)
+        # Costs are ON by default since the Stream 2 fix: the recorded fill
+        # price is the slipped buy price (200.00 open + 5bps), not the raw open.
+        self.assertAlmostEqual(result.snapshots[0].fill_prices["LEADER"], 200.10)
         self.assertGreater(result.final_equity, 0)
 
     def test_dual_momentum_backtest_handles_empty_series_without_crashing(self):
