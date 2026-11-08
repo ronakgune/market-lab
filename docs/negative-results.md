@@ -114,6 +114,30 @@ Rules:
   fresh pre-registered stream (signals on QQQ, next-open fills, a
   kill rule aimed at the whipsaw mechanism above).
 
+### VIX overlay on vt_trend — measured 2026-11-07, no benefit on this base
+- **Evidence:** trials #13–16 (`vt_trend_vix` = vt_trend wrapped in
+  `vol_regime.with_vix_overlay`, VIXY ratio vs SMA20, veto >1.4 with
+  3-bar cooldown, graduated scale between) vs trials #1–8 baselines,
+  SPY/QQQ 2016-11..2026-11, identical harness.
+- **Result:** SPY full Sharpe 0.94 vs 0.93 (CAGR 8.89% vs 9.77%,
+  maxDD −15.3% vs −15.7%); SPY later-half 0.63 vs 0.74 (CAGR −1.7pp);
+  QQQ full 0.77 vs 0.68 (CAGR +0.4pp, maxDD −18.0% vs −17.8% —
+  *deeper*); QQQ later-half 0.55 vs 0.58. Mixed Sharpe noise, a
+  consistent CAGR cost, and no drawdown relief — drawdown protection
+  is the overlay's entire reason to exist, and maxDD moved ≤0.4pp
+  in either direction.
+- **Mechanism:** vt_trend already de-risks through its own
+  vol-targeting and trend exit; by the time VIXY prints 40% above
+  its 20-day mean the base has mostly exited, so the veto fires
+  after the fact — and the cooldown + graduated re-entry then miss
+  early recoveries (the whipsaw cost BreakFree's own research
+  documented).
+- **Rule:** do not stack the vol overlay on an already vol-targeted
+  trend base. The overlay stays in the toolbox (`vol_regime.py`,
+  adversarially tested) for a base that lacks its own vol response;
+  re-measuring it there is a new pre-registered question, not a
+  retune of this one.
+
 ## METHOD TRAPS — results that look better than they are
 
 ### Survivorship in the XS-momentum backtest — flagged 2026-11-06
