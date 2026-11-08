@@ -70,7 +70,7 @@ def guarded_ensemble(
         try:
             sig = member()
             ok = (
-                sig is not None
+                isinstance(sig, Signal)
                 and math.isfinite(sig.confidence)
                 and math.isfinite(sig.target_weight)
             )

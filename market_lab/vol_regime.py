@@ -154,13 +154,16 @@ def overlay_by_date(
     from vol bars up to and including that date only, so truncating
     the vol series never changes an earlier date's state.
 
-    ``vol_bars`` must be in chronological order — the ratio windows
-    and the veto latch are sequence concepts, and silently accepting
-    shuffled bars would manufacture nonsense states.
+    ``vol_bars`` must be in strictly chronological order — the ratio
+    windows and the veto latch are sequence concepts, and silently
+    accepting shuffled or duplicate-dated bars would manufacture
+    nonsense states (a duplicated date would also break the
+    truncation promise below: which of the pair a truncation keeps
+    would decide that date's state).
     """
     for prev, cur in zip(vol_bars, vol_bars[1:]):
-        if cur.date < prev.date:
-            raise ValueError("vol_bars must be in chronological order")
+        if cur.date <= prev.date:
+            raise ValueError("vol_bars must be strictly chronological (no duplicate dates)")
     ratios = vix_ratios([b.close for b in vol_bars], lookback)
     states = overlay_states(ratios, veto_ratio=veto_ratio, cooldown_bars=cooldown_bars)
     return {bar.date: state for bar, state in zip(vol_bars, states)}
@@ -173,7 +176,17 @@ def apply_overlay(signal: Signal, state: OverlayState) -> Signal:
     BUY target weights only (BreakFree scales the long side only);
     SELL/HOLD signals pass through unscaled. The returned signal's
     reason and evidence always record what the overlay did.
+
+    Hand-built states are validated like every other input here: a
+    non-finite ratio, or a sub-1.0 scale with no ratio to explain it,
+    is refused with ValueError rather than crashing or passing
+    silently. (States produced by ``overlay_states`` always satisfy
+    both checks.)
     """
+    if state.ratio is not None and not math.isfinite(state.ratio):
+        raise ValueError(f"overlay ratio must be finite or None, got {state.ratio}")
+    if state.scale < 1.0 and state.ratio is None and not state.vetoed:
+        raise ValueError("inconsistent overlay state: scale < 1.0 with ratio None and no veto")
     evidence = dict(signal.evidence)
     evidence["vix_ratio"] = state.ratio
     evidence["vix_scale"] = state.scale
