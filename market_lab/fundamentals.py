@@ -75,7 +75,14 @@ _OCF = (
     "NetCashProvidedByUsedInOperatingActivities",
     "NetCashProvidedByUsedInOperatingActivitiesContinuingOperations",
 )
-_CAPEX = ("PaymentsToAcquirePropertyPlantAndEquipment",)
+# Capex: some filers tag purchases of property and equipment under
+# an alternate concept (NVDA: PaymentsToAcquireProductiveAssets in
+# recent years; COIN: PaymentsToAcquireOtherProductiveAssets).
+_CAPEX = (
+    "PaymentsToAcquirePropertyPlantAndEquipment",
+    "PaymentsToAcquireProductiveAssets",
+    "PaymentsToAcquireOtherProductiveAssets",
+)
 
 _ANNUAL_MIN_DAYS, _ANNUAL_MAX_DAYS = 330, 400
 _QUARTER_MIN_DAYS, _QUARTER_MAX_DAYS = 70, 110
@@ -213,16 +220,93 @@ def _duration_days(entry: dict) -> int | None:
     return (end - start).days
 
 
+def _entries_by_concept(facts: dict, concepts: tuple[str, ...]) -> list[list[dict]]:
+    """Entry lists for each concept in the preference tuple that has any."""
+    gaap = (facts.get("facts") or {}).get("us-gaap") or {}
+    out: list[list[dict]] = []
+    for concept in concepts:
+        node = gaap.get(concept) or {}
+        units = node.get("units") or {}
+        entries = units.get("USD")
+        if not entries:
+            for values in units.values():
+                if values:
+                    entries = values
+                    break
+        if entries:
+            out.append(list(entries))
+    return out
+
+
 def _latest_instant(facts: dict, concepts: tuple[str, ...], as_of: date) -> float | None:
-    """Latest instant value visible as of the date (max end, then max filed)."""
+    """Latest instant value visible as of the date.
+
+    Each fallback concept is evaluated on its own; the value with
+    the freshest (period end, filed) wins, so a stale primary tag
+    never shadows a current fallback tag.
+    """
     best: tuple[date, date, float] | None = None
-    for entry in _concept_entries(facts, concepts):
-        if not _visible(entry, as_of):
-            continue
-        key = (_parse_date(entry["end"]), _parse_date(entry["filed"]), float(entry["val"]))
-        if best is None or key > best:
-            best = key
+    for entries in _entries_by_concept(facts, concepts):
+        for entry in entries:
+            if not _visible(entry, as_of):
+                continue
+            key = (_parse_date(entry["end"]), _parse_date(entry["filed"]), float(entry["val"]))
+            if best is None or key > best:
+                best = key
     return best[2] if best else None
+
+
+def _instant_by_end(facts: dict, concepts: tuple[str, ...], as_of: date) -> dict[date, float]:
+    """Instant values by period end, as known on as_of (latest filing wins).
+
+    Fallback concepts are not merged (that could double-count); the
+    concept whose coverage reaches the latest period end is used.
+    """
+    best: dict[date, float] = {}
+    for entries in _entries_by_concept(facts, concepts):
+        by_end: dict[date, tuple[date, float]] = {}
+        for entry in entries:
+            if not _visible(entry, as_of):
+                continue
+            end = _parse_date(entry["end"])
+            filed = _parse_date(entry["filed"])
+            if end not in by_end or filed > by_end[end][0]:
+                by_end[end] = (filed, float(entry["val"]))
+        candidate = {end: val for end, (filed, val) in by_end.items()}
+        if candidate and (not best or max(candidate) > max(best)):
+            best = candidate
+    return best
+
+
+def _leverage(facts: dict, as_of: date) -> float | None:
+    """Total liabilities / total assets at ONE balance-sheet date.
+
+    Filers tag the numerator inconsistently, so at each candidate
+    date the total is taken from the first construction available:
+    the `Liabilities` total itself; else current + noncurrent
+    liabilities; else (liabilities + equity) - equity. The latest
+    date at which assets AND a total can both be formed wins — a
+    ratio mixed from two different dates would be meaningless
+    (AMZN's abandoned `LiabilitiesNoncurrent` tag ends in 2012).
+    """
+    assets = _instant_by_end(facts, _ASSETS, as_of)
+    if not assets:
+        return None
+    direct = _instant_by_end(facts, _LIABILITIES, as_of)
+    current = _instant_by_end(facts, ("LiabilitiesCurrent",), as_of)
+    noncurrent = _instant_by_end(facts, ("LiabilitiesNoncurrent",), as_of)
+    total_equity_side = _instant_by_end(facts, ("LiabilitiesAndStockholdersEquity",), as_of)
+    equity = _instant_by_end(facts, _EQUITY, as_of)
+    for end in sorted(assets, reverse=True):
+        if assets[end] <= 0:
+            continue
+        if end in direct:
+            return direct[end] / assets[end]
+        if end in current and end in noncurrent:
+            return (current[end] + noncurrent[end]) / assets[end]
+        if end in total_equity_side and end in equity:
+            return (total_equity_side[end] - equity[end]) / assets[end]
+    return None
 
 
 def _annual_values(facts: dict, concepts: tuple[str, ...], as_of: date) -> dict[date, float]:
@@ -230,20 +314,34 @@ def _annual_values(facts: dict, concepts: tuple[str, ...], as_of: date) -> dict[
 
     Deduped by period end keeping the latest filing visible on
     as_of, so a restatement or comparative column supersedes the
-    original only from its own filed date onward.
+    original only from its own filed date onward. Fallback concepts
+    are not merged (that could double-count a year tagged twice);
+    the concept whose annual coverage reaches the latest period
+    end is used.
     """
-    by_end: dict[date, tuple[date, float]] = {}
-    for entry in _concept_entries(facts, concepts):
-        if not _visible(entry, as_of):
-            continue
-        days = _duration_days(entry)
-        if days is None or not (_ANNUAL_MIN_DAYS <= days <= _ANNUAL_MAX_DAYS):
-            continue
-        end = _parse_date(entry["end"])
-        filed = _parse_date(entry["filed"])
-        if end not in by_end or filed > by_end[end][0]:
-            by_end[end] = (filed, float(entry["val"]))
-    return {end: val for end, (filed, val) in sorted(by_end.items())}
+    best: dict[date, float] = {}
+    for entries in _entries_by_concept(facts, concepts):
+        by_end: dict[date, tuple[date, float]] = {}
+        for entry in entries:
+            if not _visible(entry, as_of):
+                continue
+            # A fiscal year is a 10-K fact (fp=FY). Duration alone is
+            # not enough: 10-Qs carry trailing-twelve-month columns
+            # (e.g. AMZN OCF starting Oct 1) whose ~364-day span is
+            # indistinguishable from a fiscal year by length.
+            if not str(entry.get("form", "")).startswith("10-K") or entry.get("fp") != "FY":
+                continue
+            days = _duration_days(entry)
+            if days is None or not (_ANNUAL_MIN_DAYS <= days <= _ANNUAL_MAX_DAYS):
+                continue
+            end = _parse_date(entry["end"])
+            filed = _parse_date(entry["filed"])
+            if end not in by_end or filed > by_end[end][0]:
+                by_end[end] = (filed, float(entry["val"]))
+        candidate = {end: val for end, (filed, val) in sorted(by_end.items())}
+        if candidate and (not best or max(candidate) > max(best)):
+            best = candidate
+    return best
 
 
 def _trailing_net_income(facts: dict, as_of: date) -> float | None:
@@ -322,17 +420,11 @@ def evaluate_quality(symbol: str, facts: dict, as_of: date) -> QualityReport:
                 f"years; need at least {FCF_MIN_POSITIVE_YEARS} of {FCF_WINDOW_YEARS}"
             )
 
-    assets = _latest_instant(facts, _ASSETS, as_of)
-    liabilities = _latest_instant(facts, _LIABILITIES, as_of)
-    leverage: float | None = None
-    if assets is None or liabilities is None:
-        reasons.append("no assets/liabilities facts filed by the as-of date")
-    elif assets <= 0:
-        reasons.append(f"non-positive total assets ({assets:,.0f}); leverage undefined")
-    else:
-        leverage = liabilities / assets
-        if leverage > LEVERAGE_CAP:
-            reasons.append(f"leverage {leverage:.2f} above the {LEVERAGE_CAP:.2f} cap")
+    leverage = _leverage(facts, as_of)
+    if leverage is None:
+        reasons.append("no assets/liabilities pair at a single balance-sheet date filed by the as-of date")
+    elif leverage > LEVERAGE_CAP:
+        reasons.append(f"leverage {leverage:.2f} above the {LEVERAGE_CAP:.2f} cap")
 
     return QualityReport(
         symbol=symbol,

@@ -106,6 +106,53 @@ def test_missing_data_fails_closed():
     assert len(report.reasons) >= 3
 
 
+def test_liabilities_fall_back_to_current_plus_noncurrent():
+    # AMZN/AMD never tag the bare `Liabilities` total; the gate must
+    # use current + noncurrent at the latest date reporting both.
+    def inst(end, filed, val):
+        return {"end": end, "filed": filed, "form": "10-K", "fp": "FY", "val": val}
+
+    facts = {"facts": {"us-gaap": {
+        "Assets": {"units": {"USD": [inst("2024-12-31", "2025-02-14", 20_000_000_000)]}},
+        "LiabilitiesCurrent": {"units": {"USD": [inst("2024-12-31", "2025-02-14", 4_000_000_000)]}},
+        "LiabilitiesNoncurrent": {"units": {"USD": [inst("2024-12-31", "2025-02-14", 7_000_000_000)]}},
+    }}}
+    report = evaluate_quality("ACME", facts, date(2025, 3, 1))
+    assert report.leverage == 11_000_000_000 / 20_000_000_000
+    assert not any("assets/liabilities" in r for r in report.reasons)
+
+
+def test_trailing_twelve_month_columns_are_not_fiscal_years():
+    # AMZN pattern: a 10-Q carries an LTM column (start Oct 1, ~364
+    # days) that mimics a fiscal year by duration. Only 10-K / fp=FY
+    # facts may count as annual.
+    facts = copy.deepcopy(ACME)
+    ni = facts["facts"]["us-gaap"]["NetIncomeLoss"]["units"]["USD"]
+    ni.append({"accn": "x", "start": "2024-10-01", "end": "2025-09-30",
+               "val": 5_000_000_000, "filed": "2025-10-30", "form": "10-Q", "fp": "Q3", "fy": 2026})
+    report = evaluate_quality("ACME", facts, date(2025, 12, 1))
+    assert report.net_income == 1_200_000_000  # still FY2024 from the 10-K
+
+
+def test_fresher_fallback_concept_wins_over_stale_primary():
+    # NVDA pattern: the primary capex tag stops being used and a
+    # fallback tag carries the recent years. The gate must evaluate
+    # the fresh series, not whichever tag happens to be listed first.
+    facts = copy.deepcopy(ACME)
+    gaap = facts["facts"]["us-gaap"]
+    stale = [dict(e, val=9_000_000_000) for e in
+             gaap["PaymentsToAcquirePropertyPlantAndEquipment"]["units"]["USD"][:1]]
+    gaap["PaymentsToAcquirePropertyPlantAndEquipment"]["units"]["USD"] = stale
+    gaap["PaymentsToAcquireProductiveAssets"] = {
+        "units": {"USD": copy.deepcopy(
+            _load("acme_companyfacts.json")["facts"]["us-gaap"]
+            ["PaymentsToAcquirePropertyPlantAndEquipment"]["units"]["USD"])}
+    }
+    report = evaluate_quality("ACME", facts, date(2025, 3, 1))
+    assert len(report.fcf_by_year) == 5  # the full fresh series, via the fallback tag
+    assert report.passes
+
+
 def test_non_company_symbols_are_excluded_with_reason():
     for symbol, needle in (("SPY", "index ETF"), ("VIXY", "volatility"), ("IBIT", "crypto")):
         report = quality_as_of(symbol, date(2025, 1, 1), facts={})
