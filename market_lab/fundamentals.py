@@ -33,7 +33,9 @@ from pathlib import Path
 
 from .config import FUNDAMENTALS_DIR
 
-USER_AGENT = "market-lab/1.0 (personal research tool; github.com/ronakgune/market-lab)"
+# SEC fair access requires a declared User-Agent with a contact;
+# without the email-shaped contact, data.sec.gov answers 403.
+USER_AGENT = "market-lab palluron18@gmail.com"
 TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
 COMPANYFACTS_URL = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
 _REQUEST_DELAY_SECONDS = 0.15  # SEC fair access: stay far under 10 req/s
