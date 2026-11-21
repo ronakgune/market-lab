@@ -39,6 +39,21 @@ validation discipline:
   BreakFree's insufficient-data behavior — but non-finite or
   non-positive vol closes are refused with ValueError rather than
   silently neutralized. No fabricated values, ever.
+- STALE-VETO GUARD (added 2026-11-20, after trials 13-16): the wrapper
+  looks up the most recent vol state on or before the signal bar, so a
+  vol series that ENDS mid-veto would otherwise latch the position
+  flat forever on data that no longer exists. If the looked-up state
+  is vetoed and the vol series has produced no observation within
+  ``VETO_STALENESS_BARS`` (10) trading days before the current bar —
+  trading days counted as bars of the signal's own series after the
+  last vol date — the veto LAPSES: the day is treated as no-veto
+  (neutral scale, the stale ratio still recorded in evidence, plus a
+  ``vix_veto_stale`` evidence marker). An observation exactly 10
+  trading days old is still fresh; the 11th day lapses. The guard
+  covers the veto only: a stale non-veto regime scale still applies,
+  because the failure being fixed is the indefinite flat latch, not
+  regime sizing. The guard reads only the current bar prefix, so it
+  is truncation-invariant like everything else here.
 """
 
 from __future__ import annotations
@@ -55,6 +70,7 @@ from .signals import Signal
 REGIME_LOOKBACK = 20
 VETO_RATIO = 1.4
 COOLDOWN_BARS = 3
+VETO_STALENESS_BARS = 10
 
 
 class OverlayState(NamedTuple):
@@ -217,6 +233,7 @@ def with_vix_overlay(
     lookback: int = REGIME_LOOKBACK,
     veto_ratio: float = VETO_RATIO,
     cooldown_bars: int = COOLDOWN_BARS,
+    stale_veto_bars: int = VETO_STALENESS_BARS,
 ) -> Callable[[str, list[Bar]], Signal]:
     """Wrap a ``fn(symbol, bars) -> Signal`` with the vol-regime overlay.
 
@@ -226,7 +243,17 @@ def with_vix_overlay(
     repo's lookahead pre-flight and backtest engine treat it exactly
     like any other signal. Dates before the vol series starts — or an
     empty vol series — leave the base signal untouched.
+
+    Stale-veto guard: if the looked-up state is vetoed but the vol
+    series has no observation within ``stale_veto_bars`` trading days
+    before the current bar (trading days = bars of this signal's own
+    series after the last vol date; exactly ``stale_veto_bars`` is
+    still fresh), the veto lapses — the day is applied as no-veto with
+    the stale ratio kept in evidence and ``vix_veto_stale`` set. A
+    stale non-veto scale is NOT lapsed; see the module docstring.
     """
+    if stale_veto_bars < 0:
+        raise ValueError(f"stale_veto_bars must be >= 0, got {stale_veto_bars}")
     states = overlay_by_date(vol_bars, lookback=lookback, veto_ratio=veto_ratio, cooldown_bars=cooldown_bars)
     state_dates = sorted(states)
 
@@ -237,7 +264,17 @@ def with_vix_overlay(
         idx = bisect.bisect_right(state_dates, bars[-1].date) - 1
         if idx < 0:
             return base
-        return apply_overlay(base, states[state_dates[idx]])
+        state = states[state_dates[idx]]
+        if state.vetoed:
+            bar_dates = [b.date for b in bars]
+            bars_since_vol = len(bars) - bisect.bisect_right(bar_dates, state_dates[idx])
+            if bars_since_vol > stale_veto_bars:
+                lapsed = OverlayState(ratio=state.ratio, scale=1.0, vetoed=False)
+                out = apply_overlay(base, lapsed)
+                evidence = dict(out.evidence)
+                evidence["vix_veto_stale"] = 1.0
+                return replace(out, evidence=evidence)
+        return apply_overlay(base, state)
 
     wrapped.__name__ = f"{getattr(signal_fn, '__name__', 'signal')}+vix_overlay"
     return wrapped
@@ -247,6 +284,7 @@ __all__ = [
     "COOLDOWN_BARS",
     "REGIME_LOOKBACK",
     "VETO_RATIO",
+    "VETO_STALENESS_BARS",
     "OverlayState",
     "apply_overlay",
     "overlay_by_date",
