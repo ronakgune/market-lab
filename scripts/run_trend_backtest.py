@@ -17,6 +17,12 @@ Discipline wired in, not optional:
 
 Usage:
     python scripts/run_trend_backtest.py [--symbols SPY QQQ] [--cash 25000]
+        [--strategies vt_trend vt_trend_vix]
+
+Strategies: ``tsmom`` and ``vt_trend`` are the base signals.
+``vt_trend_vix`` is vt_trend wrapped in the BreakFree-harvested
+vol-regime overlay (market_lab.vol_regime: VIXY-ratio veto + regime
+sizing, dissected 2026-11-07; see docs/negative-results.md).
 """
 
 from __future__ import annotations
@@ -33,11 +39,18 @@ from market_lab.config import PRICE_DIR
 from market_lab.daily_data import load_daily_bars
 from market_lab.signals import generate_tsmom_signal, generate_vt_trend_signal
 from market_lab.validation import TrialLedger, check_lookahead, signal_series
+from market_lab.vol_regime import COOLDOWN_BARS, REGIME_LOOKBACK, VETO_RATIO, with_vix_overlay
 
 STRATEGIES = {
     "tsmom": generate_tsmom_signal,
     "vt_trend": generate_vt_trend_signal,
 }
+# Overlay strategies wrap a base signal; the vol series is VIXY daily
+# bars from the same provenanced cache as every other input.
+OVERLAY_STRATEGIES = {
+    "vt_trend_vix": "vt_trend",
+}
+VOL_SYMBOL = "VIXY"
 LEDGER_PATH = PRICE_DIR.parent / "trials.jsonl"
 PREFLIGHT_BARS = 300  # causality is length-independent; 300 bars keeps it exhaustive + fast
 
@@ -50,7 +63,8 @@ def cagr(total_return: float, trading_days: int) -> float:
 
 
 def run_one(symbol: str, strategy_name: str, signal_fn, bars, meta, cash: float,
-            evaluation_start_index: int | None, ledger: TrialLedger) -> dict:
+            evaluation_start_index: int | None, ledger: TrialLedger,
+            extra_params: dict | None = None, notes: str | None = None) -> dict:
     # Refuse degenerate runs outright: the engine returns all-zero results
     # for them, and recording those would plant phantom trials in the
     # program-wide ledger (a fake "Sharpe 0.0" measurement that never ran,
@@ -91,6 +105,7 @@ def run_one(symbol: str, strategy_name: str, signal_fn, bars, meta, cash: float,
             "evaluation_start_index": evaluation_start_index,
             "initial_cash": cash,
             "execution": "next-open, 5bps slippage + $1 commission",
+            **(extra_params or {}),
         },
         dataset={
             "symbol": symbol,
@@ -109,7 +124,7 @@ def run_one(symbol: str, strategy_name: str, signal_fn, bars, meta, cash: float,
             "max_drawdown": row["max_drawdown"],
             "trades": float(row["trades"]),
         },
-        notes=f"trend stream first measurement; eval={row['eval']}",
+        notes=notes or f"trend stream first measurement; eval={row['eval']}",
     )
     return row
 
@@ -124,18 +139,40 @@ def main() -> int:
 
     ledger = TrialLedger(args.ledger)
     rows: list[dict] = []
+    vix_bars = None
+    if any(name in OVERLAY_STRATEGIES for name in args.strategies):
+        vix_bars, _vix_meta = load_daily_bars(VOL_SYMBOL)
     for symbol in args.symbols:
         bars, meta = load_daily_bars(symbol)
         for name in args.strategies:
-            fn = STRATEGIES[name]
+            extra_params = None
+            notes = None
+            if name in OVERLAY_STRATEGIES:
+                fn = with_vix_overlay(STRATEGIES[OVERLAY_STRATEGIES[name]], vix_bars)
+                extra_params = {
+                    "vix_overlay": {
+                        "vol_symbol": VOL_SYMBOL,
+                        "lookback": REGIME_LOOKBACK,
+                        "veto_ratio": VETO_RATIO,
+                        "cooldown_bars": COOLDOWN_BARS,
+                        "source": "BreakFree harvest 2026-11-07 (market_lab.vol_regime)",
+                    }
+                }
+                notes = "vt_trend + VIX-regime overlay (BreakFree harvest); eval={eval}"
+            else:
+                fn = STRATEGIES[name]
             preflight = check_lookahead(signal_series(fn, symbol), bars[:PREFLIGHT_BARS])
             if not preflight.passed:
                 print(f"{symbol} {name}: LOOKAHEAD PRE-FLIGHT FAILED — run aborted")
                 for v in preflight.violations[:3]:
                     print(f"  cutoff={v.cutoff} index={v.index} full={v.full_value} truncated={v.truncated_value}")
                 return 1
-            rows.append(run_one(symbol, name, fn, bars, meta, args.cash, None, ledger))
-            rows.append(run_one(symbol, name, fn, bars, meta, args.cash, len(bars) // 2, ledger))
+            for eval_start in (None, len(bars) // 2):
+                rows.append(run_one(
+                    symbol, name, fn, bars, meta, args.cash, eval_start, ledger,
+                    extra_params=extra_params,
+                    notes=notes.format(eval="full" if eval_start is None else "later-half") if notes else None,
+                ))
 
     print(f"{'symbol':6s} {'strategy':9s} {'eval':10s} {'CAGR':>7s} {'bench':>7s} {'Sharpe':>7s} {'maxDD':>7s} {'trades':>6s}")
     for r in rows:
